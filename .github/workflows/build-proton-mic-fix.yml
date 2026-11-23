@@ -1,0 +1,106 @@
+name: Build CHIM 3.5.1 Proton microphone fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out CHIM and pinned submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python for guarded source patch
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Patch only the microphone buffer requeue
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          source = Path('Plugin/Voicerec.cpp')
+          original = source.read_text(encoding='utf-8')
+          pattern = re.compile(
+              r'(?m)^(?P<indent>[ \t]*)\}[ \t]*\r?\n'
+              r'(?:[ \t]*\r?\n)*'
+              r'[ \t]*// Re-add the header to the queue[^\r\n]*\r?\n'
+              r'(?:[ \t]*\r?\n)*'
+              r'[ \t]*waveInPrepareHeader\(wi, &h, sizeof\(h\)\);[ \t]*\r?\n'
+              r'(?:[ \t]*\r?\n)*'
+              r'[ \t]*waveInAddBuffer\(wi, &h, sizeof\(h\)\);[ \t]*\r?\n'
+          )
+          hits = list(pattern.finditer(original))
+          if len(hits) != 1:
+              raise SystemExit(f'Expected exactly one unfixed recording loop; found {len(hits)}. Stopping safely.')
+
+          def fix(match):
+              indent = match.group('indent')
+              inner = indent + '    '
+              return (
+                  inner + '// Requeue only a completed recording buffer.\n'
+                  + inner + 'waveInPrepareHeader(wi, &h, sizeof(h));\n'
+                  + inner + 'waveInAddBuffer(wi, &h, sizeof(h));\n'
+                  + indent + '}\n'
+              )
+
+          result = pattern.sub(fix, original, count=1)
+          source.write_text(result, encoding='utf-8', newline='\n')
+          print('Applied the Wine/Proton microphone fix to Plugin/Voicerec.cpp')
+          '@ | Set-Content -Path apply-proton-mic-fix.py -Encoding utf8
+          python apply-proton-mic-fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff -- Plugin/Voicerec.cpp
+
+      - name: Bootstrap vcpkg without changing the runner's global toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build and run native tests in isolated scratch directory
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          if errorlevel 1 exit /b 1
+          set "VCPKG_ROOT=%RUNNER_TEMP%\vcpkg"
+          set "CMAKE_SKYRIM_FOLDER=%RUNNER_TEMP%\chim-build-stage"
+          if not exist "%CMAKE_SKYRIM_FOLDER%\Data" mkdir "%CMAKE_SKYRIM_FOLDER%\Data"
+          cd Plugin
+          cmake --preset release -DBUILD_TESTING=ON
+          if errorlevel 1 exit /b 1
+          cmake --build build/release --parallel 4
+          if errorlevel 1 exit /b 1
+          ctest --test-dir build/release --output-on-failure
+          if errorlevel 1 exit /b 1
+
+      - name: Package DLL as a separate Mod Organizer 2 override
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = 'Plugin/build/release/AIAgent.dll'
+          if (!(Test-Path $dll)) { throw 'Build completed without AIAgent.dll' }
+          New-Item -ItemType Directory -Force 'mo2-override/SKSE/Plugins' | Out-Null
+          Copy-Item $dll 'mo2-override/SKSE/Plugins/AIAgent.dll'
+          Get-FileHash 'mo2-override/SKSE/Plugins/AIAgent.dll' -Algorithm SHA256 | Format-List
+
+      - name: Upload MO2 mod archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: CHIM-3.5.1-Proton-microphone-fix-MO2
+          path: mo2-override/
+          if-no-files-found: error
